@@ -9,10 +9,19 @@ import (
 	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"io"
 	"math/big"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/crypto/ocsp"
 )
 
 func TestSignedDataVerifierAcceptsValidAppleLikeChain(t *testing.T) {
@@ -103,14 +112,173 @@ func TestSignedDataVerifierRejectsInvalidInputs(t *testing.T) {
 	}
 }
 
+func TestSignedDataVerifierOnlineChecksAcceptsGoodOCSPAndCaches(t *testing.T) {
+	fixed := time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
+	var requestCount atomic.Int64
+	var chain generatedChain
+	server := testOCSPServer(t, fixed, &chain, func(cert *x509.Certificate) int {
+		requestCount.Add(1)
+		return ocsp.Good
+	})
+	defer server.Close()
+	chain = testChain(t, fixed.Add(-time.Hour), fixed.Add(time.Hour), server.URL)
+	verifier := testVerifierWithOptions(t, SignedDataVerifierOptions{
+		RootCertificates:   [][]byte{chain.rootDER},
+		BundleID:           "com.example.app",
+		Environment:        EnvironmentSandbox,
+		EnableOnlineChecks: true,
+		Now:                func() time.Time { return fixed },
+	})
+	signed := signJWS(t, chain.x5c(), testTransactionPayload(fixed), chain.leafKey, "ES256")
+
+	for i := 0; i < 2; i++ {
+		got, err := verifier.VerifyAndDecodeTransaction(signed)
+		if err != nil {
+			t.Fatalf("verify transaction: %v", err)
+		}
+		if got.TransactionID != "tx-1" {
+			t.Fatalf("transaction id = %q", got.TransactionID)
+		}
+	}
+	if got := requestCount.Load(); got != 2 {
+		t.Fatalf("ocsp requests = %d, want 2 for one leaf and one intermediate check", got)
+	}
+}
+
+func TestSignedDataVerifierOnlineChecksRejectsRevokedOCSP(t *testing.T) {
+	fixed := time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
+	var chain generatedChain
+	server := testOCSPServer(t, fixed, &chain, func(cert *x509.Certificate) int {
+		if cert.SerialNumber.Cmp(chain.leafCert.SerialNumber) == 0 {
+			return ocsp.Revoked
+		}
+		return ocsp.Good
+	})
+	defer server.Close()
+	chain = testChain(t, fixed.Add(-time.Hour), fixed.Add(time.Hour), server.URL)
+	verifier := testVerifierWithOptions(t, SignedDataVerifierOptions{
+		RootCertificates:   [][]byte{chain.rootDER},
+		BundleID:           "com.example.app",
+		Environment:        EnvironmentSandbox,
+		EnableOnlineChecks: true,
+		Now:                func() time.Time { return fixed },
+	})
+
+	_, err := verifier.VerifyAndDecodeTransaction(signJWS(t, chain.x5c(), testTransactionPayload(fixed), chain.leafKey, "ES256"))
+	var verificationErr *VerificationError
+	if !errors.As(err, &verificationErr) || verificationErr.Status != InvalidCertificate {
+		t.Fatalf("error = %#v, want InvalidCertificate", err)
+	}
+}
+
+func TestSignedDataVerifierOnlineChecksTreatsOCSPResponderErrorsAsRetryable(t *testing.T) {
+	fixed := time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	chain := testChain(t, fixed.Add(-time.Hour), fixed.Add(time.Hour), server.URL)
+	verifier := testVerifierWithOptions(t, SignedDataVerifierOptions{
+		RootCertificates:   [][]byte{chain.rootDER},
+		BundleID:           "com.example.app",
+		Environment:        EnvironmentSandbox,
+		EnableOnlineChecks: true,
+		Now:                func() time.Time { return fixed },
+	})
+
+	_, err := verifier.VerifyAndDecodeTransaction(signJWS(t, chain.x5c(), testTransactionPayload(fixed), chain.leafKey, "ES256"))
+	var verificationErr *VerificationError
+	if !errors.As(err, &verificationErr) || verificationErr.Status != RetryableVerificationFailure {
+		t.Fatalf("error = %#v, want RetryableVerificationFailure", err)
+	}
+}
+
+func TestSignedDataVerifierOnlineChecksUseCurrentDateForCertificateValidity(t *testing.T) {
+	signedAt := time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
+	now := signedAt.Add(2 * time.Hour)
+	chain := testChain(t, signedAt.Add(-time.Hour), signedAt.Add(time.Hour))
+	signed := signJWS(t, chain.x5c(), testTransactionPayload(signedAt), chain.leafKey, "ES256")
+
+	offline := testVerifierWithOptions(t, SignedDataVerifierOptions{
+		RootCertificates: [][]byte{chain.rootDER},
+		BundleID:         "com.example.app",
+		Environment:      EnvironmentSandbox,
+		Now:              func() time.Time { return now },
+	})
+	if _, err := offline.VerifyAndDecodeTransaction(signed); err != nil {
+		t.Fatalf("offline verification should use signedDate: %v", err)
+	}
+
+	online := testVerifierWithOptions(t, SignedDataVerifierOptions{
+		RootCertificates:   [][]byte{chain.rootDER},
+		BundleID:           "com.example.app",
+		Environment:        EnvironmentSandbox,
+		EnableOnlineChecks: true,
+		Now:                func() time.Time { return now },
+	})
+	_, err := online.VerifyAndDecodeTransaction(signed)
+	var verificationErr *VerificationError
+	if !errors.As(err, &verificationErr) || verificationErr.Status != InvalidCertificate {
+		t.Fatalf("error = %#v, want InvalidCertificate", err)
+	}
+}
+
+func TestSignedDataVerifierAppleSandboxGoldenTransaction(t *testing.T) {
+	path := filepath.Join("testdata", "apple_sandbox_signed_transaction_info.jws")
+	raw, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		t.Skip("add a real Apple Sandbox signedTransactionInfo fixture at testdata/apple_sandbox_signed_transaction_info.jws")
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	signed := strings.TrimSpace(string(raw))
+	if signed == "" {
+		t.Skip("testdata/apple_sandbox_signed_transaction_info.jws is empty")
+	}
+	parts := strings.Split(signed, ".")
+	if len(parts) != 3 {
+		t.Fatalf("golden fixture is not a compact JWS")
+	}
+	var payload JWSTransactionDecodedPayload
+	if err := decodeJWTSegment(parts[1], &payload); err != nil {
+		t.Fatalf("decode golden payload: %v", err)
+	}
+	if payload.BundleID == "" {
+		t.Fatalf("golden payload is missing bundleId")
+	}
+	verifier, err := NewSignedDataVerifier(SignedDataVerifierOptions{
+		BundleID:    payload.BundleID,
+		Environment: EnvironmentSandbox,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := verifier.VerifyAndDecodeTransaction(signed)
+	if err != nil {
+		t.Fatalf("verify Apple Sandbox golden transaction: %v", err)
+	}
+	if got.Environment != EnvironmentSandbox {
+		t.Fatalf("environment = %q, want Sandbox", got.Environment)
+	}
+	if got.BundleID != payload.BundleID {
+		t.Fatalf("bundle id = %q, want %q", got.BundleID, payload.BundleID)
+	}
+}
+
 func testVerifier(t *testing.T, rootDER []byte, now time.Time) *SignedDataVerifier {
 	t.Helper()
-	verifier, err := NewSignedDataVerifier(SignedDataVerifierOptions{
+	return testVerifierWithOptions(t, SignedDataVerifierOptions{
 		RootCertificates: [][]byte{rootDER},
 		BundleID:         "com.example.app",
 		Environment:      EnvironmentSandbox,
 		Now:              func() time.Time { return now },
 	})
+}
+
+func testVerifierWithOptions(t *testing.T, opts SignedDataVerifierOptions) *SignedDataVerifier {
+	t.Helper()
+	verifier, err := NewSignedDataVerifier(opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,10 +299,15 @@ func testTransactionPayload(now time.Time) map[string]any {
 }
 
 type generatedChain struct {
-	rootDER         []byte
-	intermediateDER []byte
-	leafDER         []byte
-	leafKey         *ecdsa.PrivateKey
+	rootDER          []byte
+	intermediateDER  []byte
+	leafDER          []byte
+	rootCert         *x509.Certificate
+	intermediateCert *x509.Certificate
+	leafCert         *x509.Certificate
+	rootKey          *ecdsa.PrivateKey
+	intermediateKey  *ecdsa.PrivateKey
+	leafKey          *ecdsa.PrivateKey
 }
 
 func (c generatedChain) x5c() []string {
@@ -145,11 +318,15 @@ func (c generatedChain) x5c() []string {
 	}
 }
 
-func testChain(t *testing.T, notBefore, notAfter time.Time) generatedChain {
+func testChain(t *testing.T, notBefore, notAfter time.Time, ocspServerURL ...string) generatedChain {
 	t.Helper()
 	rootKey := newP256Key(t)
 	intermediateKey := newP256Key(t)
 	leafKey := newP256Key(t)
+	var ocspServers []string
+	if len(ocspServerURL) > 0 && ocspServerURL[0] != "" {
+		ocspServers = []string{ocspServerURL[0]}
+	}
 
 	rootTemplate := &x509.Certificate{
 		SerialNumber:          big.NewInt(1),
@@ -177,6 +354,7 @@ func testChain(t *testing.T, notBefore, notAfter time.Time) generatedChain {
 		IsCA:                  true,
 		BasicConstraintsValid: true,
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		OCSPServer:            ocspServers,
 		ExtraExtensions:       []pkix.Extension{{Id: appleWWDROID, Value: []byte{0x05, 0x00}}},
 	}
 	intermediateDER, err := x509.CreateCertificate(rand.Reader, intermediateTemplate, rootCert, &intermediateKey.PublicKey, rootKey)
@@ -195,19 +373,83 @@ func testChain(t *testing.T, notBefore, notAfter time.Time) generatedChain {
 		NotAfter:              notAfter,
 		BasicConstraintsValid: true,
 		KeyUsage:              x509.KeyUsageDigitalSignature,
+		OCSPServer:            ocspServers,
 		ExtraExtensions:       []pkix.Extension{{Id: appleReceiptSigningOID, Value: []byte{0x05, 0x00}}},
 	}
 	leafDER, err := x509.CreateCertificate(rand.Reader, leafTemplate, intermediateCert, &leafKey.PublicKey, intermediateKey)
 	if err != nil {
 		t.Fatal(err)
 	}
+	leafCert, err := x509.ParseCertificate(leafDER)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	return generatedChain{
-		rootDER:         rootDER,
-		intermediateDER: intermediateDER,
-		leafDER:         leafDER,
-		leafKey:         leafKey,
+		rootDER:          rootDER,
+		intermediateDER:  intermediateDER,
+		leafDER:          leafDER,
+		rootCert:         rootCert,
+		intermediateCert: intermediateCert,
+		leafCert:         leafCert,
+		rootKey:          rootKey,
+		intermediateKey:  intermediateKey,
+		leafKey:          leafKey,
 	}
+}
+
+func testOCSPServer(t *testing.T, now time.Time, chain *generatedChain, status func(*x509.Certificate) int) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("ocsp method = %s, want POST", r.Method)
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read ocsp request: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		request, err := ocsp.ParseRequest(raw)
+		if err != nil {
+			t.Errorf("parse ocsp request: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		cert, issuer, responder, signer := chain.ocspMaterial(request.SerialNumber)
+		if cert == nil {
+			t.Errorf("unexpected ocsp serial: %s", request.SerialNumber)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		response, err := ocsp.CreateResponse(issuer, responder, ocsp.Response{
+			Status:             status(cert),
+			SerialNumber:       cert.SerialNumber,
+			ThisUpdate:         now.Add(-time.Minute),
+			NextUpdate:         now.Add(time.Hour),
+			RevokedAt:          now.Add(-time.Minute),
+			SignatureAlgorithm: x509.ECDSAWithSHA256,
+		}, signer)
+		if err != nil {
+			t.Errorf("create ocsp response: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/ocsp-response")
+		_, _ = w.Write(response)
+	}))
+}
+
+func (c generatedChain) ocspMaterial(serial *big.Int) (*x509.Certificate, *x509.Certificate, *x509.Certificate, *ecdsa.PrivateKey) {
+	if c.leafCert != nil && serial.Cmp(c.leafCert.SerialNumber) == 0 {
+		return c.leafCert, c.intermediateCert, c.intermediateCert, c.intermediateKey
+	}
+	if c.intermediateCert != nil && serial.Cmp(c.intermediateCert.SerialNumber) == 0 {
+		return c.intermediateCert, c.rootCert, c.rootCert, c.rootKey
+	}
+	return nil, nil, nil, nil
 }
 
 func newP256Key(t *testing.T) *ecdsa.PrivateKey {

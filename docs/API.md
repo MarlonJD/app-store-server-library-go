@@ -592,9 +592,10 @@ environment; plain JSON decoding is not enough.
 
 ```go
 verifier, err := appstore.NewSignedDataVerifier(appstore.SignedDataVerifierOptions{
-	BundleID:    "com.example.app",
-	AppAppleID:  1234567890,
-	Environment: appstore.EnvironmentProduction,
+	BundleID:           "com.example.app",
+	AppAppleID:         1234567890,
+	Environment:        appstore.EnvironmentProduction,
+	EnableOnlineChecks: true,
 })
 if err != nil {
 	return err
@@ -618,7 +619,36 @@ verifier, err := appstore.NewSignedDataVerifier(appstore.SignedDataVerifierOptio
 | `BundleID` | When set, the payload bundle ID must match this value. |
 | `AppAppleID` | Used for App Apple ID validation in production verification. |
 | `Environment` | When set, the payload environment must match this value. |
+| `EnableOnlineChecks` | Enables current-date certificate validation plus OCSP revocation checks for the leaf and intermediate certificates. Defaults to offline verification. |
+| `HTTPClient` | Optional HTTP client used for OCSP requests when online checks are enabled. Defaults to a client with a 30-second timeout. |
 | `Now` | Clock used for certificate validation when a payload has no signing date. Defaults to `time.Now`. |
+
+### Online Checks and OCSP
+
+By default, verification is offline: the certificate chain is checked at the
+JWS signing date, which matches the signed payload's historical validity. When
+`EnableOnlineChecks` is `true`, the verifier behaves more like Apple's official
+server libraries:
+
+- Certificate validity is checked against the current time.
+- OCSP is requested for the leaf certificate and the intermediate certificate.
+- Non-200 OCSP responses, network failures, oversized responses, and expired
+  OCSP responses return `RetryableVerificationFailure`.
+- Revoked certificates return `InvalidCertificate`.
+- Successfully verified certificate chains are cached for 15 minutes, up to 32
+  entries.
+
+```go
+verifier, err := appstore.NewSignedDataVerifier(appstore.SignedDataVerifierOptions{
+	BundleID:           "com.example.app",
+	AppAppleID:         1234567890,
+	Environment:        appstore.EnvironmentProduction,
+	EnableOnlineChecks: true,
+	HTTPClient: &http.Client{
+		Timeout: 10 * time.Second,
+	},
+})
+```
 
 ### Verification Rules
 
@@ -631,7 +661,10 @@ The verifier checks:
 - The root certificate matches one of the trusted Apple root certificates
 - The leaf certificate has the Apple receipt signing extension
 - The intermediate certificate has the Apple WWDR extension
-- The certificate chain is valid at the payload signing date
+- The certificate chain is valid at the payload signing date, or at the current
+  time when `EnableOnlineChecks` is enabled
+- When `EnableOnlineChecks` is enabled, OCSP status is good for the leaf and
+  intermediate certificates
 - The ES256 signature is valid for the leaf public key
 - Bundle ID, App Apple ID, and environment match the verifier options
 
@@ -1025,6 +1058,18 @@ if err != nil {
 `SignedDataVerifierOptions.RootCertificates` can be set to a test root
 certificate. When it is empty, the SDK uses its bundled Apple root certificates.
 
+The repository also includes a skipped golden test hook for a real Apple
+Sandbox transaction JWS. To enable it, place a disposable Sandbox
+`signedTransactionInfo` compact JWS at:
+
+```text
+testdata/apple_sandbox_signed_transaction_info.jws
+```
+
+Do not use production user data in this fixture. The test derives the bundle ID
+from the fixture payload, verifies the JWS against the bundled Apple roots, and
+asserts that the payload environment is `Sandbox`.
+
 ## Security Notes
 
 - Do not log `.p8` private key contents or commit them to source control.
@@ -1033,6 +1078,8 @@ certificate. When it is empty, the SDK uses its bundled Apple root certificates.
   `VerifyAndDecodeNotification`.
 - For production, set `BundleID`, `AppAppleID`, and `Environment` together for
   stricter validation.
+- For stricter production verification, enable `EnableOnlineChecks` so revoked
+  Apple signing certificates are rejected through OCSP.
 - Keep sandbox and production client/verifier instances separate to reduce
   operational mistakes.
 - `APIError.Body` may contain user or purchase data. Mask it according to your

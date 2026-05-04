@@ -13,8 +13,9 @@ pagination, webhook handling, and end-to-end examples.
 
 ```go
 verifier, err := appstore.NewSignedDataVerifier(appstore.SignedDataVerifierOptions{
-	BundleID:    "com.example.app",
-	Environment: appstore.EnvironmentSandbox,
+	BundleID:           "com.example.app",
+	Environment:        appstore.EnvironmentSandbox,
+	EnableOnlineChecks: true,
 })
 if err != nil {
 	panic(err)
@@ -29,7 +30,10 @@ _ = tx.ProductID
 
 The verifier requires `alg=ES256`, validates the `x5c` certificate chain
 against Apple root certificates only, checks certificate validity at the JWS
-`signedDate`, and rejects tampered payloads or signatures.
+`signedDate` by default, and rejects tampered payloads or signatures. When
+`EnableOnlineChecks` is enabled, certificate validity is checked at the current
+time and OCSP revocation checks are performed for the leaf and intermediate
+certificates.
 
 ## API client
 
