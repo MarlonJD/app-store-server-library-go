@@ -3,6 +3,12 @@
 Go helpers for the App Store Server API and App Store Server Notifications.
 The root package is `appstore`.
 
+## Documentation
+
+See the detailed SDK API guide in [docs/API.md](docs/API.md). It covers client
+configuration, signed data verification, endpoint methods, error handling,
+pagination, webhook handling, and end-to-end examples.
+
 ## Signed data verification
 
 ```go
